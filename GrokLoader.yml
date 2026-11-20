@@ -1,0 +1,436 @@
+name: Build libgroksoundboard.so
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write source
+        run: |
+          cat > soundboard.cpp <<'SB_EOF'
+          // libgroksoundboard.so - native audio engine for GrokSoundboard (Unity, Android arm64).
+          // Loads .wav / .ogg from a folder, converts to 48 kHz stereo, mixes up to 16 voices via AAudio.
+
+          #include <aaudio/AAudio.h>
+          #include <android/log.h>
+          #include <dirent.h>
+
+          #include <sys/stat.h>
+
+          #include <algorithm>
+          #include <atomic>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <mutex>
+          #include <string>
+          #include <thread>
+          #include <vector>
+
+          #ifdef SB_HAVE_VORBIS
+          extern "C" int stb_vorbis_decode_filename(const char* filename, int* channels,
+                                                    int* sample_rate, short** output);
+          #endif
+
+          #define TAG "GrokSoundboard"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+          #define EXPORT extern "C" __attribute__((visibility("default")))
+
+          namespace {
+
+          constexpr int kRate = 48000;
+          constexpr int kMaxVoices = 16;
+          constexpr int kMaxClips = 512;
+
+          struct Clip {
+              std::string name;
+              std::string path;
+              std::vector<int16_t> pcm;  // interleaved stereo @ kRate
+              uint32_t frames = 0;
+          };
+
+          struct Voice {
+              std::atomic<const Clip*> clip{nullptr};
+              uint32_t pos = 0;  // only touched by the audio thread while clip != null
+          };
+
+          Clip* g_clips[kMaxClips];
+          std::atomic<int> g_count{0};
+          Voice g_voices[kMaxVoices];
+          std::atomic<bool> g_stopAll{false};
+
+          AAudioStream* g_stream = nullptr;
+          bool g_wantStream = false;
+          std::mutex g_streamMutex;
+          std::mutex g_loadMutex;
+
+          // ---------------------------------------------------------------- decoding
+
+          bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+              FILE* f = fopen(path.c_str(), "rb");
+              if (!f) return false;
+              fseek(f, 0, SEEK_END);
+              long n = ftell(f);
+              fseek(f, 0, SEEK_SET);
+              if (n <= 0) { fclose(f); return false; }
+              out.resize((size_t)n);
+              size_t got = fread(out.data(), 1, out.size(), f);
+              fclose(f);
+              return got == out.size();
+          }
+
+          inline uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+          inline uint32_t rd32(const uint8_t* p) {
+              return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+          }
+
+          // Output: interleaved float samples, `ch` channels, `rate` Hz.
+          bool decode_wav(const std::vector<uint8_t>& d, std::vector<float>& out, int& ch, int& rate) {
+              if (d.size() < 12 || memcmp(d.data(), "RIFF", 4) != 0 || memcmp(d.data() + 8, "WAVE", 4) != 0)
+                  return false;
+
+              uint16_t fmt = 0, bits = 0;
+              ch = 0; rate = 0;
+              const uint8_t* data = nullptr;
+              size_t dataLen = 0;
+
+              size_t pos = 12;
+              while (pos + 8 <= d.size()) {
+                  uint32_t sz = rd32(&d[pos + 4]);
+                  const uint8_t* body = &d[pos + 8];
+                  size_t avail = d.size() - (pos + 8);
+                  if (memcmp(&d[pos], "fmt ", 4) == 0 && sz >= 16 && avail >= 16) {
+                      fmt = rd16(body);
+                      ch = rd16(body + 2);
+                      rate = (int)rd32(body + 4);
+                      bits = rd16(body + 14);
+                      if (fmt == 0xFFFE && sz >= 26 && avail >= 26) fmt = rd16(body + 24);  // extensible
+                  } else if (memcmp(&d[pos], "data", 4) == 0) {
+                      data = body;
+                      dataLen = std::min<size_t>(sz, avail);
+                      break;
+                  }
+                  pos += 8 + (size_t)sz + (sz & 1);
+              }
+
+              if (!data || ch < 1 || rate <= 0) return false;
+              bool ok = (fmt == 3 && bits == 32) ||
+                        (fmt == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32));
+              if (!ok) { LOGW("Unsupported WAV format (tag %u, %u-bit)", fmt, bits); return false; }
+
+              size_t bytes = bits / 8;
+              size_t n = dataLen / bytes;
+              n -= n % (size_t)ch;
+              out.resize(n);
+
+              for (size_t i = 0; i < n; i++) {
+                  const uint8_t* p = data + i * bytes;
+                  float v;
+                  if (fmt == 3) {
+                      float f; memcpy(&f, p, 4); v = f;
+                  } else if (bits == 8) {
+                      v = ((int)p[0] - 128) / 128.0f;
+                  } else if (bits == 16) {
+                      v = (int16_t)rd16(p) / 32768.0f;
+                  } else if (bits == 24) {
+                      int32_t s = (int32_t)(((uint32_t)p[0] << 8) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 24));
+                      v = s / 2147483648.0f;
+                  } else {
+                      v = (int32_t)rd32(p) / 2147483648.0f;
+                  }
+                  out[i] = v;
+              }
+              return true;
+          }
+
+          // Resample (linear) to kRate and force stereo, stored as int16.
+          Clip* build_clip(const std::vector<float>& in, int ch, int rate) {
+              size_t inFrames = in.size() / (size_t)ch;
+              if (inFrames == 0) return nullptr;
+
+              double ratio = (double)kRate / rate;
+              size_t outFrames = (size_t)(inFrames * ratio);
+              if (outFrames == 0) return nullptr;
+
+              Clip* c = new Clip();
+              c->frames = (uint32_t)outFrames;
+              c->pcm.resize(outFrames * 2);
+
+              for (size_t i = 0; i < outFrames; i++) {
+                  double src = i / ratio;
+                  size_t i0 = (size_t)src;
+                  if (i0 >= inFrames) i0 = inFrames - 1;
+                  size_t i1 = (i0 + 1 < inFrames) ? i0 + 1 : i0;
+                  float t = (float)(src - (double)i0);
+                  for (int k = 0; k < 2; k++) {
+                      int cc = (k < ch) ? k : 0;  // mono -> both sides, >2ch -> first two
+                      float v = in[i0 * ch + cc] * (1.0f - t) + in[i1 * ch + cc] * t;
+                      v = std::max(-1.0f, std::min(1.0f, v));
+                      c->pcm[i * 2 + k] = (int16_t)lrintf(v * 32767.0f);
+                  }
+              }
+              return c;
+          }
+
+          std::string lower_ext(const std::string& name) {
+              size_t dot = name.find_last_of('.');
+              if (dot == std::string::npos) return "";
+              std::string e = name.substr(dot);
+              for (auto& ch : e) ch = (char)tolower((unsigned char)ch);
+              return e;
+          }
+
+          Clip* load_clip(const std::string& path, const std::string& ext) {
+              std::vector<float> samples;
+              int ch = 0, rate = 0;
+
+              if (ext == ".wav") {
+                  std::vector<uint8_t> bytes;
+                  if (!read_file(path, bytes) || !decode_wav(bytes, samples, ch, rate)) return nullptr;
+              } else if (ext == ".ogg") {
+          #ifdef SB_HAVE_VORBIS
+                  short* pcm = nullptr;
+                  int n = stb_vorbis_decode_filename(path.c_str(), &ch, &rate, &pcm);
+                  if (n <= 0 || !pcm || ch < 1) { free(pcm); return nullptr; }
+                  samples.resize((size_t)n * ch);
+                  for (size_t i = 0; i < samples.size(); i++) samples[i] = pcm[i] / 32768.0f;
+                  free(pcm);
+          #else
+                  LOGW("OGG support not compiled in (stb_vorbis.c missing): %s", path.c_str());
+                  return nullptr;
+          #endif
+              } else {
+                  return nullptr;
+              }
+
+              Clip* c = build_clip(samples, ch, rate);
+              if (!c) return nullptr;
+              c->path = path;
+              std::string file = path.substr(path.find_last_of('/') + 1);
+              c->name = file.substr(0, file.find_last_of('.'));
+              return c;
+          }
+
+          // ------------------------------------------------------------------- audio
+
+          aaudio_data_callback_result_t on_audio(AAudioStream*, void*, void* audioData, int32_t numFrames) {
+              float* out = static_cast<float*>(audioData);
+              const int32_t samples = numFrames * 2;
+              memset(out, 0, sizeof(float) * (size_t)samples);
+
+              if (g_stopAll.exchange(false)) {
+                  for (auto& v : g_voices) v.clip.store(nullptr, std::memory_order_release);
+              }
+
+              const float scale = 1.0f / 32768.0f;
+              for (auto& v : g_voices) {
+                  const Clip* c = v.clip.load(std::memory_order_acquire);
+                  if (!c) continue;
+                  uint32_t n = std::min<uint32_t>(c->frames - v.pos, (uint32_t)numFrames);
+                  const int16_t* s = c->pcm.data() + (size_t)v.pos * 2;
+                  for (uint32_t i = 0; i < n * 2; i++) out[i] += s[i] * scale;
+                  v.pos += n;
+                  if (v.pos >= c->frames) v.clip.store(nullptr, std::memory_order_release);
+              }
+
+              for (int32_t i = 0; i < samples; i++) out[i] = std::max(-1.0f, std::min(1.0f, out[i]));
+              return AAUDIO_CALLBACK_RESULT_CONTINUE;
+          }
+
+          bool open_stream_locked() {
+              AAudioStreamBuilder* b = nullptr;
+              if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return false;
+
+              AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+              AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+              AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
+              AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_FLOAT);
+              AAudioStreamBuilder_setChannelCount(b, 2);
+              AAudioStreamBuilder_setSampleRate(b, kRate);
+          #if defined(__ANDROID_API__) && __ANDROID_API__ >= 28
+              AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
+          #endif
+              AAudioStreamBuilder_setDataCallback(b, on_audio, nullptr);
+              AAudioStreamBuilder_setErrorCallback(
+                  b,
+                  [](AAudioStream*, void*, aaudio_result_t err) {
+                      if (err != AAUDIO_ERROR_DISCONNECTED) return;
+                      // Headset / output device changed: reopen from a separate thread.
+                      std::thread([] {
+                          std::lock_guard<std::mutex> lock(g_streamMutex);
+                          if (!g_wantStream) return;
+                          if (g_stream) { AAudioStream_close(g_stream); g_stream = nullptr; }
+                          open_stream_locked();
+                      }).detach();
+                  },
+                  nullptr);
+
+              aaudio_result_t r = AAudioStreamBuilder_openStream(b, &g_stream);
+              AAudioStreamBuilder_delete(b);
+              if (r != AAUDIO_OK) {
+                  LOGE("openStream failed: %s", AAudio_convertResultToText(r));
+                  g_stream = nullptr;
+                  return false;
+              }
+              if (AAudioStream_getSampleRate(g_stream) != kRate)
+                  LOGW("Stream rate is %d, expected %d (pitch may be off)", AAudioStream_getSampleRate(g_stream), kRate);
+
+              r = AAudioStream_requestStart(g_stream);
+              if (r != AAUDIO_OK) {
+                  LOGE("requestStart failed: %s", AAudio_convertResultToText(r));
+                  AAudioStream_close(g_stream);
+                  g_stream = nullptr;
+                  return false;
+              }
+              return true;
+          }
+
+          }  // namespace
+
+          // ------------------------------------------------------------------ exports
+
+          EXPORT int sb_init() {
+              std::lock_guard<std::mutex> lock(g_streamMutex);
+              g_wantStream = true;
+              if (g_stream) return 0;
+              return open_stream_locked() ? 0 : -1;
+          }
+
+          // Loads any new .wav/.ogg in `folder` (sorted by name). Already-loaded files are skipped.
+          // Safe to call from a background thread. Returns total clip count.
+          EXPORT int sb_load_folder(const char* folder) {
+              if (!folder) return g_count.load();
+              std::lock_guard<std::mutex> lock(g_loadMutex);
+
+              DIR* d = opendir(folder);
+              if (!d) { LOGW("Cannot open folder: %s", folder); return g_count.load(); }
+
+              std::vector<std::string> files;
+              while (dirent* e = readdir(d)) {
+                  std::string n = e->d_name;
+                  std::string ext = lower_ext(n);
+                  if (ext == ".wav" || ext == ".ogg") files.push_back(n);
+              }
+              closedir(d);
+              std::sort(files.begin(), files.end());
+
+              for (const auto& f : files) {
+                  std::string path = std::string(folder) + "/" + f;
+                  int count = g_count.load();
+
+                  bool have = false;
+                  for (int i = 0; i < count && !have; i++) have = (g_clips[i]->path == path);
+                  if (have) continue;
+                  if (count >= kMaxClips) { LOGW("Clip limit (%d) reached", kMaxClips); break; }
+
+                  Clip* c = load_clip(path, lower_ext(f));
+                  if (!c) { LOGW("Failed to load: %s", path.c_str()); continue; }
+
+                  g_clips[count] = c;
+                  g_count.store(count + 1, std::memory_order_release);
+                  LOGI("Loaded: %s", c->name.c_str());
+              }
+              LOGI("Grok Soundboard loaded %d sounds", g_count.load());
+              return g_count.load();
+          }
+
+          EXPORT int sb_count() { return g_count.load(std::memory_order_acquire); }
+
+          // Pointer stays valid until sb_shutdown().
+          EXPORT const char* sb_name(int index) {
+              if (index < 0 || index >= g_count.load(std::memory_order_acquire)) return "";
+              return g_clips[index]->name.c_str();
+          }
+
+          EXPORT int sb_play(int index) {
+              if (index < 0 || index >= g_count.load(std::memory_order_acquire)) return -1;
+              for (auto& v : g_voices) {
+                  if (v.clip.load(std::memory_order_acquire) == nullptr) {
+                      v.pos = 0;
+                      v.clip.store(g_clips[index], std::memory_order_release);
+                      return 0;
+                  }
+              }
+              return -2;  // all voices busy
+          }
+
+          EXPORT void sb_stop_all() { g_stopAll.store(true); }
+
+          EXPORT void sb_pause(int paused) {
+              std::lock_guard<std::mutex> lock(g_streamMutex);
+              if (!g_stream) return;
+              if (paused) AAudioStream_requestPause(g_stream);
+              else AAudioStream_requestStart(g_stream);
+          }
+
+          EXPORT void sb_shutdown() {
+              {
+                  std::lock_guard<std::mutex> lock(g_streamMutex);
+                  g_wantStream = false;
+                  if (g_stream) { AAudioStream_close(g_stream); g_stream = nullptr; }
+              }
+              std::lock_guard<std::mutex> lock(g_loadMutex);
+              for (auto& v : g_voices) v.clip.store(nullptr);
+              int n = g_count.exchange(0);
+              for (int i = 0; i < n; i++) { delete g_clips[i]; g_clips[i] = nullptr; }
+          }
+
+          // ------------------------------------------------------- loader / self-start
+          // Build with -DSB_AUTOSTART=ON for the version you inject with a lib loader.
+          // Anything that dlopen()s or System.loadLibrary()s this file runs the constructor below,
+          // so no C# is needed to get the engine going.
+          #ifdef SB_AUTOSTART
+
+          static std::string app_sound_folder() {
+              char buf[256] = {0};
+              FILE* f = fopen("/proc/self/cmdline", "r");  // process name == package name
+              if (!f) return "";
+              size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+              fclose(f);
+              if (n == 0) return "";
+              return std::string("/storage/emulated/0/Android/data/") + buf + "/files/Soundboard";
+          }
+
+          static void autostart_thread() {
+              std::this_thread::sleep_for(std::chrono::seconds(5));  // let the game finish starting up
+              if (sb_init() != 0) { LOGE("autostart: audio init failed"); return; }
+
+              std::string dir = app_sound_folder();
+              if (dir.empty()) { LOGE("autostart: could not work out package name"); return; }
+              mkdir(dir.c_str(), 0777);
+
+              int n = sb_load_folder(dir.c_str());
+              LOGI("autostart: %d sounds in %s", n, dir.c_str());
+              if (n > 0) sb_play(0);  // audible proof the .so loaded and audio works
+          }
+
+          __attribute__((constructor)) static void sb_on_load() {
+              LOGI("libgroksoundboard loaded");
+              std::thread(autostart_thread).detach();
+          }
+
+          #endif  // SB_AUTOSTART
+          SB_EOF
+      - name: Build both .so files (arm64)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$TC/aarch64-linux-android29-clang"
+          CXX="$TC/aarch64-linux-android29-clang++"
+          curl -fsSL -o stb_vorbis.c https://raw.githubusercontent.com/nothings/stb/master/stb_vorbis.c
+          "$CC" -c -O2 -fPIC stb_vorbis.c -o stb_vorbis.o
+          mkdir out
+          FLAGS="-shared -fPIC -O2 -std=c++17 -fvisibility=hidden -static-libstdc++ -DSB_HAVE_VORBIS"
+          "$CXX" $FLAGS soundboard.cpp stb_vorbis.o -laaudio -llog -o out/libgroksoundboard.so
+          "$CXX" $FLAGS -DSB_AUTOSTART soundboard.cpp stb_vorbis.o -laaudio -llog -o out/libgroksoundboard_loader.so
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libgroksoundboard
+          path: out/
